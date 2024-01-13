@@ -1,9 +1,24 @@
 mod util;
-use util::*;
 
-use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::System::*;
-use windows_sys::Win32::UI::WindowsAndMessaging as Ui;
+use anyhow::Context;
+use util::*;
+//
+use windows::core::*;
+use windows::Win32::Foundation::*;
+use windows::Win32::System::DataExchange::*;
+use windows::Win32::System::LibraryLoader::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+const CLASS_NAME: PCSTR = s!("ClipboardWatcher");
+
+unsafe fn on_clipboard_update() {
+    let Ok(bitmap) = clipboard_bitmap() else {
+        return;
+    };
+    if let Err(err) = clipboard_save_image(&bitmap) {
+        eprintln!("couldn't save clipboard image: {:?}", err);
+    }
+}
 
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
@@ -12,74 +27,68 @@ unsafe extern "system" fn window_proc(
     l_param: LPARAM,
 ) -> LRESULT {
     match msg {
-        Ui::WM_CREATE => {
-            if DataExchange::AddClipboardFormatListener(hwnd) == 0 {
-                eprintln!("couldn't add clipboard listener ({})", GetLastError());
-                std::process::exit(1);
-            }
-        }
-        Ui::WM_DESTROY => {
-            if DataExchange::RemoveClipboardFormatListener(hwnd) == 0 {
-                eprintln!("couldn't remove clipboard listener ({})", GetLastError());
-                std::process::exit(1);
-            }
-        }
-        Ui::WM_CLIPBOARDUPDATE => {
-            let start = std::time::Instant::now();
-            let result = clipboard_save_bitmap();
-            let elapsed = start.elapsed().as_secs_f64();
-            match result {
-                Err(err) => eprintln!("error: {}", err),
-                Ok(_) => println!("saved clipboard image ({:.3}ms)", elapsed * 1e3),
-            }
-        }
+        // https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-create
+        WM_CREATE => AddClipboardFormatListener(hwnd)
+            .context("couldn't add clipboard format listener")
+            .unwrap(),
+        // https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-destroy
+        WM_DESTROY => RemoveClipboardFormatListener(hwnd)
+            .context("couldn't remove clipboard format listener")
+            .unwrap(),
+        // https://learn.microsoft.com/en-us/windows/win32/dataxchg/wm-clipboardupdate
+        WM_CLIPBOARDUPDATE => on_clipboard_update(),
         // ignore all other messages
         _ => (),
     }
-
-    Ui::DefWindowProcA(hwnd, msg, w_param, l_param)
+    DefWindowProcA(hwnd, msg, w_param, l_param)
 }
 
 fn main() {
     // https://stackoverflow.com/a/65857206
     unsafe {
-        let mut window = std::mem::zeroed::<Ui::WNDCLASSEXA>();
-        window.cbSize = std::mem::size_of::<Ui::WNDCLASSEXA>() as u32;
+        let mut window = std::mem::zeroed::<WNDCLASSEXA>();
+        window.cbSize = std::mem::size_of::<WNDCLASSEXA>() as u32;
         window.lpfnWndProc = Some(window_proc);
-        window.lpszClassName = windows_sys::s!("ClipboardWatcher");
+        window.lpszClassName = CLASS_NAME;
 
-        if Ui::RegisterClassExA(&window as *const Ui::WNDCLASSEXA) == 0 {
-            eprintln!("couldn't register window ({})", GetLastError());
+        if RegisterClassExA(&window as *const WNDCLASSEXA) == 0 {
+            eprintln!("couldn't register window ({:?})", GetLastError());
             std::process::exit(1);
         }
 
-        let handle = Ui::CreateWindowExA(
+        let module = GetModuleHandleA(PCSTR(std::ptr::null()))
+            .context("couldn't get handle to own module")
+            .unwrap();
+
+        let handle = CreateWindowExA(
+            WINDOW_EX_STYLE(0),
+            CLASS_NAME,
+            PCSTR(std::ptr::null()),
+            WINDOW_STYLE(0),
             0,
-            windows_sys::s!("ClipboardWatcher"),
-            windows_sys::s!(""),
             0,
             0,
             0,
-            0,
-            0,
-            Ui::HWND_MESSAGE,
-            0,
-            LibraryLoader::GetModuleHandleA(std::ptr::null()),
-            std::ptr::null(),
+            HWND_MESSAGE,
+            HMENU(0),
+            module,
+            None,
         );
-        if handle == 0 {
-            eprintln!("couldn't create window ({})", GetLastError());
+
+        if handle == HWND(0) {
+            eprintln!("couldn't create window ({:?})", GetLastError());
             std::process::exit(1);
         }
 
         println!("watching the clipboard...");
 
-        let mut msg = std::mem::zeroed::<Ui::MSG>();
-        while Ui::GetMessageA(&mut msg as *mut Ui::MSG, 0, 0, 0) != FALSE {
-            Ui::TranslateMessage(&msg as *const Ui::MSG);
-            Ui::DispatchMessageA(&msg as *const Ui::MSG);
+        let mut msg = std::mem::zeroed::<MSG>();
+        while GetMessageA(&mut msg as *mut MSG, HWND(0), 0, 0) != FALSE {
+            let _ = TranslateMessage(&msg as *const MSG);
+            let _ = DispatchMessageA(&msg as *const MSG);
         }
-        eprintln!("error receiving message ({})", GetLastError());
+
+        eprintln!("error receiving message ({:?})", GetLastError());
         std::process::exit(1);
     }
 }
